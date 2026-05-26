@@ -79,7 +79,7 @@ def _split_along_leading_axis(
     Raises:
       ValueError: If the leading dimension is not divisible by ``num_devices``.
     """
-    def _split(arr: jnp.ndarray) -> jnp.ndarray:
+    def _split(arr: np.ndarray) -> np.ndarray:
         n = arr.shape[0]
         if n % num_devices != 0:
             raise ValueError(
@@ -101,7 +101,7 @@ def _concat_along_leading_axis(tree: PyTree) -> PyTree:
     Returns:
       A pytree with arrays of shape [N, ...] where N = num_devices * shard_size.
     """
-    def _concat(arr: jnp.ndarray) -> jnp.ndarray:
+    def _concat(arr: np.ndarray) -> np.ndarray:
         return arr.reshape((-1,) + arr.shape[2:])
 
     return jax.tree_util.tree_map(_concat, tree)
@@ -131,7 +131,7 @@ def make_parallel_diffusion_fn(
     """
     pmapped = jax.pmap(single_device_fn, axis_name='devices')
 
-    def parallel_fn(positions: jnp.ndarray, *args: Any, **kwargs: Any) -> PyTree:
+    def parallel_fn(positions: np.ndarray, *args: Any, **kwargs: Any) -> PyTree:
         num_devices = jax.device_count()
         num_samples = positions.shape[0]
 
