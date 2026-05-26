@@ -17,6 +17,7 @@ from alphafold3.common import base_config
 from alphafold3.model import model_config
 from alphafold3.model.components import haiku_modules as hm
 from alphafold3.model.components import mapping
+from alphafold3.model.gpu import fused_ops
 from alphafold3.model.network import diffusion_transformer
 import haiku as hk
 import jax
@@ -389,14 +390,27 @@ class OuterProductMean(hk.Module):
         init=hk.initializers.Constant(0.0),
     )
 
-    def compute_chunk(left_act):
-      # Make sure that the 'b' dimension is the most minor batch like dimension
-      # so it will be treated as the real batch by XLA (both during the forward
-      # and the backward pass)
-      left_act = jnp.transpose(left_act, [0, 2, 1])
-      act = jnp.einsum('acb,ade->dceb', left_act, right_act)
-      act = jnp.einsum('dceb,cef->dbf', act, output_w) + output_b
-      return jnp.transpose(act, [1, 0, 2])
+    if self.global_config.use_fused_outer_product_scan:
+      # Memory-efficient path: scan over left-channel axis to avoid
+      # materialising the full [N, C_outer, C_outer, chunk] intermediate.
+      # Controlled by GlobalConfig.use_fused_outer_product_scan.
+      # See alphafold3.model.gpu.fused_ops for derivation and memory analysis.
+      def compute_chunk(left_act_chunk):
+        return fused_ops.fused_outer_product_chunk(
+            left_act=left_act_chunk,
+            right_act=right_act,
+            output_w=output_w,
+            output_b=output_b,
+        )
+    else:
+      def compute_chunk(left_act):
+        # Make sure that the 'b' dimension is the most minor batch like dimension
+        # so it will be treated as the real batch by XLA (both during the forward
+        # and the backward pass)
+        left_act = jnp.transpose(left_act, [0, 2, 1])
+        act = jnp.einsum('acb,ade->dceb', left_act, right_act)
+        act = jnp.einsum('dceb,cef->dbf', act, output_w) + output_b
+        return jnp.transpose(act, [1, 0, 2])
 
     act = mapping.inference_subbatch(
         compute_chunk,

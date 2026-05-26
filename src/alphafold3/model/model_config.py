@@ -33,3 +33,17 @@ class GlobalConfig(base_config.BaseConfig):
   flash_attention_implementation: tokamax.DotProductAttentionImplementation = (
       'triton'
   )
+
+  # ---------------------------------------------------------------------------
+  # GPU acceleration options (alphafold3.model.gpu)
+  # ---------------------------------------------------------------------------
+
+  # When True, enables the fused channel-scan OuterProductMean that avoids
+  # materialising the large [N, C_outer, C_outer, chunk] intermediate tensor.
+  # Reduces peak memory ~6x for that operation at a small scan-loop overhead.
+  # Recommended for sequences > 512 residues on GPU with limited HBM.
+  # See alphafold3.model.gpu.fused_ops for derivation and memory analysis.
+  use_fused_outer_product_scan: bool = False
+
+  # When True, emit an info-level log of available JAX devices at model init.
+  log_device_info: bool = False
