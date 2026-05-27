@@ -17,7 +17,6 @@ from alphafold3.common import base_config
 from alphafold3.model import model_config
 from alphafold3.model.components import haiku_modules as hm
 from alphafold3.model.components import mapping
-from alphafold3.model.gpu import fused_ops
 from alphafold3.model.network import diffusion_transformer
 import haiku as hk
 import jax
@@ -394,7 +393,9 @@ class OuterProductMean(hk.Module):
       # Memory-efficient path: scan over left-channel axis to avoid
       # materialising the full [N, C_outer, C_outer, chunk] intermediate.
       # Controlled by GlobalConfig.use_fused_outer_product_scan.
-      # See alphafold3.model.gpu.fused_ops for derivation and memory analysis.
+      # Imported lazily so that environments without the gpu module (CPU-only,
+      # partial installs) are not broken when this flag is False (the default).
+      from alphafold3.model.gpu import fused_ops  # pylint: disable=g-import-not-at-top
       def compute_chunk(left_act_chunk):
         return fused_ops.fused_outer_product_chunk(
             left_act=left_act_chunk,

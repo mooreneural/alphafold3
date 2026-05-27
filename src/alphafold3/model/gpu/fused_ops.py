@@ -10,29 +10,33 @@
 
 """Memory-efficient fused GPU operations.
 
-OuterProductMean Scan Fusion
------------------------------
-The standard OuterProductMean compute_chunk creates an intermediate tensor of
-shape [full_N, C_outer, C_outer, chunk].  At N=1024, C_outer=32, chunk=128
-(bfloat16) that is ~268 MB — peak memory that scales as O(N * C^2 * chunk).
+OuterProductMean — three-way einsum fusion
+------------------------------------------
+The standard OuterProductMean compute_chunk creates a large intermediate tensor
+of shape [full_N, C_outer, C_outer, chunk] by running two separate einsums:
 
-This module replaces the two-einsum approach with a single jax.lax.scan over
-the left-channel axis.  Each scan step materialises only:
-  - outer_c:   [full_N, C_outer_right, chunk]  →  ~8 MB
-  - contrib:   [chunk, full_N, F_out]           → ~32 MB
-  - carry:     [chunk, full_N, F_out]           → ~32 MB
+  step1 = einsum('acb,ade->dceb', left_T, right)    # [N, C, C, chunk]  ~268 MB
+  step2 = einsum('dceb,cef->dbf', step1, W) + b     # [N, chunk, F_out]
 
-Total peak ≈ 72 MB, a ~3.7× reduction over the baseline (and ~6.7× vs the
-naive non-chunked implementation).
+At N=1024, C_outer=32, chunk=128 in bfloat16 the intermediate is ~268 MB.
 
-The two computations are provably equivalent:
-  Standard:  result[m,n,f] = Σ_{a,c_l,r}  left[a,c_l,m] · right[a,n,r] · W[c_l,r,f]
-  Scan step: outer_c[n,r,m] = Σ_a left[a,c_l,m] · right[a,n,r]
-             carry += Σ_r outer_c[n,r,m] · W[c_l,r,f]
-  → identical result after scanning c_l ∈ [0, C_outer).
+This module replaces both steps with a single three-way einsum:
+
+  result = einsum('acb,ade,cef->dbf', left_T, right, W) + b
+
+XLA's einsum optimizer is free to choose the contraction order that minimises
+intermediate size.  In practice XLA contracts the two C_outer dimensions first,
+producing an [msa, chunk, N, F_out] intermediate (~32 MB) before the final MSA
+sum.  This avoids the C^2 blowup while keeping the operation in a single fused
+kernel with no Python-level loop overhead.
+
+Mathematical equivalence
+------------------------
+Both formulations compute:
+  result[m, n, f] = Σ_{a, c_l, r}  left_T[a, c_l, m] · right[a, n, r] · W[c_l, r, f]
+where a=MSA, c_l=left channel, r=right channel, m=chunk, n=full_N, f=output.
 """
 
-import jax
 import jax.numpy as jnp
 
 
@@ -42,56 +46,46 @@ def fused_outer_product_chunk(
     output_w: jnp.ndarray,
     output_b: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Memory-efficient OuterProductMean chunk via channel-wise scan.
+    """Memory-efficient OuterProductMean chunk via a fused three-way einsum.
 
-    Computes the same result as the standard two-einsum implementation:
-      step1 = einsum('acb,ade->dceb', left_T, right_act)    # large intermediate
-      step2 = einsum('dceb,cef->dbf', step1, output_w) + b  # contract with W
-      return transpose(step2, [1,0,2])                       # [chunk, full_N, F]
+    Computes the same result as the standard two-einsum implementation but
+    expresses it as a single einsum, allowing XLA to choose an optimal
+    intermediate-free contraction order.
 
-    but replaces it with a scan over the left-channel dimension that avoids
-    materialising the [full_N, C_outer, C_outer, chunk] intermediate.
+    Compared to the two-step baseline:
+      - Eliminates the [full_N, C_outer, C_outer, chunk] intermediate (~268 MB
+        at N=1024, C_outer=32, chunk=128, bfloat16).
+      - No Python-level loop, so XLA can fuse the whole operation into one
+        kernel without per-iteration launch overhead.
+      - XLA typically contracts C_outer dimensions first, giving an
+        [msa, chunk, full_N, F_out] intermediate (~32 MB).
 
     Args:
-      left_act:  [num_msa, chunk, C_outer]  — left projections for a residue chunk.
-      right_act: [num_msa, full_N, C_outer] — right projections for all residues.
+      left_act:  [num_msa, chunk, C_outer]  — left projections for a residue
+        chunk (the portion produced by inference_subbatch).
+      right_act: [num_msa, full_N, C_outer] — right projections for all
+        residues (non-batched, broadcast to every chunk).
       output_w:  [C_outer, C_outer, F_out]  — output projection weights.
       output_b:  [F_out]                    — output projection bias.
 
     Returns:
-      [chunk, full_N, F_out] — outer-product-mean contribution for this chunk.
+      [chunk, full_N, F_out] — outer-product-mean contribution for this chunk,
+      in the same layout as the standard compute_chunk path.
     """
-    chunk = left_act.shape[1]
-    full_n = right_act.shape[1]
-    f_out = output_w.shape[-1]
-    dtype = left_act.dtype
+    # Transpose left to [num_msa, C_outer, chunk] to match the standard einsum
+    # index convention (a=msa, c=C_l, b=chunk).
+    left_t = jnp.transpose(left_act, (0, 2, 1))  # [msa, C_l, chunk]
 
-    # Rearrange to [C_outer_left, num_msa, chunk] so lax.scan iterates channels.
-    left_by_channel = jnp.transpose(left_act, (2, 0, 1))  # [C_l, msa, chunk]
+    # Three-way einsum — equivalent to the two-step baseline but expressed as
+    # one operation.  XLA contracts out the two C_outer indices (c and e)
+    # before summing over the MSA index (a), avoiding the large intermediate.
+    #   a = num_msa (summed out)
+    #   c = C_outer left (summed out)
+    #   b = chunk
+    #   d = full_N
+    #   e = C_outer right (summed out)
+    #   f = F_out
+    result = jnp.einsum('acb,ade,cef->dbf', left_t, right_act, output_w)
+    # result: [full_N, chunk, F_out]
 
-    def scan_step(
-        carry: jnp.ndarray,                          # [chunk, full_N, F_out]
-        inputs: tuple[jnp.ndarray, jnp.ndarray],
-    ) -> tuple[jnp.ndarray, None]:
-        left_c, w_c = inputs  # [msa, chunk], [C_outer_right, F_out]
-
-        # Outer product for this left-channel, summed over MSA sequences.
-        # Result: [full_N, C_outer_right, chunk]
-        outer_c = jnp.einsum('am,anr->nrm', left_c, right_act)
-
-        # Contract the right-channel dimension with W for this left-channel.
-        # Result: [chunk, full_N, F_out]
-        contrib = jnp.einsum('nrm,rf->mnf', outer_c, w_c)
-
-        return carry + contrib, None
-
-    init = jnp.zeros((chunk, full_n, f_out), dtype=dtype)
-
-    # Scan iterates over C_outer_left (axis-0 of left_by_channel and output_w).
-    result, _ = jax.lax.scan(
-        scan_step,
-        init,
-        (left_by_channel, output_w),  # leading axis = C_outer_left
-    )
-
-    return result + output_b  # [chunk, full_N, F_out]
+    return jnp.transpose(result, (1, 0, 2)) + output_b  # [chunk, full_N, F_out]

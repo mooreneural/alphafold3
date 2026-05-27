@@ -88,7 +88,7 @@ class TestModelConfigGpuFieldsInSource(unittest.TestCase):
 
 
 class TestModulesImportsFusedOps(unittest.TestCase):
-    """Check that modules.py imports from fused_ops (AST-based, no JAX)."""
+    """Check that modules.py uses fused_ops lazily (AST-based, no JAX)."""
 
     def _parse_modules(self):
         path = (
@@ -97,21 +97,26 @@ class TestModulesImportsFusedOps(unittest.TestCase):
         )
         return ast.parse(path.read_text())
 
-    def test_fused_ops_imported(self):
-        """Check for: from alphafold3.model.gpu import fused_ops."""
+    def test_fused_ops_not_top_level_import(self):
+        """fused_ops must NOT be imported at module scope — it must be lazy.
+
+        A top-level import would break CPU-only / non-GPU environments even
+        when use_fused_outer_product_scan=False (the default).  The import
+        must live inside the 'if global_config.use_fused_outer_product_scan:'
+        branch so it is only triggered when the feature is explicitly enabled.
+        """
         tree = self._parse_modules()
-        found = False
-        for node in ast.walk(tree):
+        # Walk only the top-level statements (not nested function bodies).
+        for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.ImportFrom):
-                # Module is 'alphafold3.model.gpu', name is 'fused_ops'
                 if node.module and 'gpu' in node.module:
                     if any(alias.name == 'fused_ops' for alias in node.names):
-                        found = True
-                        break
-        self.assertTrue(
-            found,
-            'modules.py does not contain "from alphafold3.model.gpu import fused_ops"',
-        )
+                        self.fail(
+                            'fused_ops is imported at module scope in modules.py. '
+                            'It must be a lazy import inside the '
+                            'use_fused_outer_product_scan branch to avoid '
+                            'breaking CPU-only environments.'
+                        )
 
     def test_fused_outer_product_chunk_referenced(self):
         """modules.py should reference the fused function by name."""

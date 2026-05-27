@@ -23,10 +23,14 @@ This module provides a thin wrapper around JAX's compilation-cache API with
 sensible defaults and logging.  Call ``setup_compilation_cache()`` once at
 process start, before any JAX operations, to enable the cache.
 
-Typical speed-up
+Known limitation
 ----------------
-* First run (cache miss): same as baseline — full compilation.
-* Subsequent runs (cache hit): model ready in ~30 seconds instead of 5–15 min.
+As of writing, AlphaFold 3's use of JAX's persistent compilation cache does
+**not** reliably persist compiled executables across separate Python processes.
+The in-process (in-memory) JAX cache does still work.  See upstream issue
+https://github.com/google-deepmind/alphafold3/issues/468 for current status.
+This module is provided for completeness and for users who may benefit once
+that issue is resolved.
 
 Example
 -------
@@ -67,6 +71,12 @@ def setup_compilation_cache(
 
     Changing any of these automatically produces a new cache entry, so stale
     caches are never silently used.
+
+    Note: As of writing, AF3 has a known issue
+    (https://github.com/google-deepmind/alphafold3/issues/468) where compiled
+    executables are not reliably reused across separate Python processes.
+    The JAX config flags set here are correct and may provide benefit once
+    that upstream issue is resolved.
 
     Args:
       cache_dir: Directory in which to store compiled executables.  Defaults to

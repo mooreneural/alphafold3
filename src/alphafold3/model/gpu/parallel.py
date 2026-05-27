@@ -10,30 +10,32 @@
 
 """Multi-GPU inference utilities for AlphaFold 3.
 
+Status: EXPERIMENTAL / NOT YET INTEGRATED
+------------------------------------------
+The functions in this module provide building blocks for distributing diffusion
+samples across multiple GPUs via ``jax.pmap``.  They are **not yet wired into
+the AlphaFold 3 inference pipeline** — ``model.py``'s ``_sample_diffusion``
+method still runs all samples on a single device.
+
+Before using ``make_parallel_diffusion_fn`` in production, note that
+``diffusion_head.sample()`` internally uses ``hk.vmap``; stacking ``jax.pmap``
+on top requires ``hk.lift()`` to correctly track Haiku module state under
+nested JAX transforms (see the Haiku transforms documentation for details).
+
 Overview
 --------
 AlphaFold 3 generates ``num_samples`` independent structure predictions via its
 diffusion head.  By default all samples run on a single device (vmapped over the
-sample axis).  On machines with N GPUs we can split those samples across devices
-using ``jax.pmap``, yielding a near-linear speed-up for the diffusion phase.
+sample axis).  On machines with N GPUs the intent is to split those samples
+across devices using ``jax.pmap``, yielding a near-linear speed-up for the
+diffusion phase.
 
-The Evoformer trunk (pairformer stack) runs once and its ``embeddings`` dict is
-broadcast to all devices; only the diffusion denoising loop and confidence head
-are parallelised.
-
-Usage example
--------------
-.. code-block:: python
-
-    import jax
-    from alphafold3.model.gpu import parallel
-
-    num_devices = jax.device_count()
-    # Ensure num_samples is divisible by the number of devices.
-    num_samples = parallel.round_samples_to_devices(20, num_devices)
-
-    sampler = parallel.MultiDeviceDiffusionSampler(model_runner, num_devices)
-    all_positions = sampler.sample(batch, embeddings, key, num_samples)
+Stable / tested utilities in this module
+-----------------------------------------
+* ``round_samples_to_devices`` — pad sample count for even device splitting.
+* ``get_num_devices`` / ``log_device_info`` — device introspection helpers.
+* ``_split_along_leading_axis`` / ``_concat_along_leading_axis`` — array
+  reshape helpers (used and tested independently of Haiku).
 """
 
 import math
