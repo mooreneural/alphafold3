@@ -114,6 +114,7 @@
     "bfloat16": "all",
     "final_init": "zeros",
     "flash_attention_implementation": "triton",
+    "log_device_info": false,
     "pair_attention_chunk_size": [
       [
         1536,
@@ -133,7 +134,8 @@
         null,
         1024
       ]
-    ]
+    ],
+    "use_fused_outer_product_scan": false
   },
   "heads": {
     "confidence": {
